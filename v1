@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+import asyncio
+import os
+import requests
+from datetime import datetime, timedelta, time
+from typing import Any, Dict, List, Optional
+from mcp.server.models import InitializationOptions
+from mcp.server import NotificationOptions, Server
+from mcp.types import Resource, Tool, TextContent, ImageContent, EmbeddedResource
+import mcp.types as types
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Configuration
+API_BASE_URL = "https://api.hubstaff.com/v2"
+TOKEN_EXCHANGE_URL = "https://account.hubstaff.com/access_tokens"
+
+class HubstaffAPI:
+    def __init__(self, refresh_token: str):
+        self.refresh_token = refresh_token
+        self.access_token = None
+        self.organization_id = None
+    
+    def get_access_token(self) -> Optional[str]:
+        """Exchange refresh token for access token"""
+        payload = {
+            "grant_type": "refresh_token",
+            "refresh_token": self.refresh_token
+        }
+        try:
+            response = requests.post(TOKEN_EXCHANGE_URL, data=payload)
+            response.raise_for_status()
+            data = response.json()
+            self.access_token = data.get("access_token")
+            return self.access_token
+        except Exception as e:
+            print(f"Error getting access token: {e}")
+            return None
+    
+    def _make_request(self, method: str, endpoint: str, params: Optional[Dict] = None) -> Optional[Dict]:
+        """Make authenticated API request"""
+        if not self.access_token:
+            self.get_access_token()
+        
+        if not self.access_token:
+            return None
+            
+        url = f"{API_BASE_URL}{endpoint}"
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        
+        try:
+            response = requests.request(method, url, headers=headers, params=params)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            print(f"API request error: {e}")
+            return None
+    
+    def get_organization_id(self) -> Optional[int]:
+        """Get the first organization ID"""
+        if self.organization_id:
+            return self.organization_id
+            
+        data = self._make_request("GET", "/organizations")
+        if data and "organizations" in data and data["organizations"]:
+            self.organization_id = data["organizations"][0]["id"]
+            return self.organization_id
+        return None
+    
+    def get_users(self) -> List[Dict]:
+        """Get all users in the organization"""
+        org_id = self.get_organization_id()
+        if not org_id:
+            return []
+            
+        data = self._make_request("GET", f"/organizations/{org_id}/members", 
+                                 params={"include": "users"})
+        return data.get("users", []) if data else []
+    
+    def get_projects(self) -> List[Dict]:
+        """Get all projects in the organization"""
+        org_id = self.get_organization_id()
+        if not org_id:
+            return []
+            
+        data = self._make_request("GET", f"/organizations/{org_id}/projects")
+        return data.get("projects", []) if data else []
+    
+    def get_productivity_summary(self, date: str) -> Dict[str, Any]:
+        """Get productivity summary for a date"""
+        try:
+            if date.lower() == 'yesterday':
+                target_date = datetime.now().date() - timedelta(days=1)
+            else:
+                target_date = datetime.strptime(date, "%Y-%m-%d").date()
+        except ValueError:
+            return {"error": "Invalid date format. Use YYYY-MM-DD or 'yesterday'"}
+        
+        org_id = self.get_organization_id()
+        if not org_id:
+            return {"error": "Could not get organization ID"}
+        
+        start_time = datetime.combine(target_date, time.min).isoformat() + "Z"
+        stop_time = datetime.combine(target_date, time.max).isoformat() + "Z"
+        
+        params = {
+            'time_slot[start]': start_time,
+            'time_slot[stop]': stop_time,
+            'include': 'users,projects'
+        }
+        
+        data = self._make_request("GET", f"/organizations/{org_id}/activities", params=params)
+        if not data or "activities" not in data:
+            return {"error": f"No activities found for {target_date}"}
+        
+        # Process the data (simplified version)
+        summary = {}
+        activities = data["activities"]
+        
+        for activity in activities:
+            user_id = activity.get("user_id")
+            tracked_seconds = activity.get("tracked", 0)
+            
+            if user_id not in summary:
+                summary[user_id] = {"total_hours": 0, "activities": 0}
+            
+            summary[user_id]["total_hours"] += tracked_seconds / 3600.0
+            summary[user_id]["activities"] += 1
+        
+        return {"date": str(target_date), "summary": summary}
+
+# Initialize Hubstaff API
+hubstaff_api = None
+
+# Create MCP Server
+server = Server("hubstaff-mcp")
+
+@server.list_tools()
+async def handle_list_tools() -> list[types.Tool]:
+    """List available tools"""
+    return [
+        types.Tool(
+            name="get_users",
+            description="Get list of all users in the Hubstaff organization",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        ),
+        types.Tool(
+            name="get_projects", 
+            description="Get list of all projects in the Hubstaff organization",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        ),
+        types.Tool(
+            name="get_productivity_summary",
+            description="Get productivity summary for a specific date",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "date": {
+                        "type": "string",
+                        "description": "Date in YYYY-MM-DD format or 'yesterday'"
+                    }
+                },
+                "required": ["date"]
+            }
+        )
+    ]
+
+@server.call_tool()
+async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+    """Handle tool calls"""
+    global hubstaff_api
+    
+    if not hubstaff_api:
+        return [types.TextContent(
+            type="text",
+            text="Hubstaff API not initialized. Please check your refresh token."
+        )]
+    
+    try:
+        if name == "get_users":
+            users = hubstaff_api.get_users()
+            return [types.TextContent(
+                type="text",
+                text=f"Found {len(users)} users:\n" + 
+                     "\n".join([f"- {user.get('name', 'Unknown')} ({user.get('email', 'No email')})" 
+                               for user in users])
+            )]
+        
+        elif name == "get_projects":
+            projects = hubstaff_api.get_projects()
+            return [types.TextContent(
+                type="text", 
+                text=f"Found {len(projects)} projects:\n" +
+                     "\n".join([f"- {project.get('name', 'Unknown')}" for project in projects])
+            )]
+        
+        elif name == "get_productivity_summary":
+            date = arguments.get("date", "yesterday")
+            summary = hubstaff_api.get_productivity_summary(date)
+            
+            if "error" in summary:
+                return [types.TextContent(type="text", text=f"Error: {summary['error']}")]
+            
+            result = f"Productivity Summary for {summary['date']}:\n"
+            for user_id, data in summary["summary"].items():
+                result += f"User {user_id}: {data['total_hours']:.2f} hours, {data['activities']} activities\n"
+            
+            return [types.TextContent(type="text", text=result)]
+        
+        else:
+            return [types.TextContent(
+                type="text",
+                text=f"Unknown tool: {name}"
+            )]
+            
+    except Exception as e:
+        return [types.TextContent(
+            type="text",
+            text=f"Error executing tool {name}: {str(e)}"
+        )]
+
+async def main():
+    global hubstaff_api
+    
+    # Get refresh token from environment variable
+    refresh_token = os.getenv("HUBSTAFF_REFRESH_TOKEN")
+    if not refresh_token:
+        print("Error: HUBSTAFF_REFRESH_TOKEN environment variable not set")
+        return
+    
+    # Initialize Hubstaff API
+    hubstaff_api = HubstaffAPI(refresh_token)
+    
+    # Test connection
+    if not hubstaff_api.get_access_token():
+        print("Error: Could not get access token")
+        return
+    
+    print("Hubstaff MCP Server starting...")
+    
+    # Run the server using stdio transport
+    from mcp.server.stdio import stdio_server
+    
+    async with stdio_server() as (read_stream, write_stream):
+        await server.run(
+            read_stream,
+            write_stream,
+            InitializationOptions(
+                server_name="hubstaff-mcp",
+                server_version="0.1.0",
+                capabilities=server.get_capabilities(
+                    notification_options=NotificationOptions(),
+                    experimental_capabilities={},
+                ),
+            ),
+        )
+
+if __name__ == "__main__":
+    asyncio.run(main())
